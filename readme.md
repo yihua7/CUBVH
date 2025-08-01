@@ -1,4 +1,6 @@
-# cuBVH Enhancement Changelog & Tutorial
+# CUBVH Changelog & Tutorial
+
+This is a modified repo from CUBVH (Kiui et.al): https://github.com/ashawkey/cubvh.
 
 This document chronicles the major enhancements made to the cuBVH library, focusing on implementing BVH serialization/pickle support and comprehensive device management. This serves as both a changelog and a tutorial for understanding how these features were implemented.
 
