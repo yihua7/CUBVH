@@ -1,0 +1,5 @@
+torch>=1.12.0
+numpy
+trimesh
+ninja
+pybind11
