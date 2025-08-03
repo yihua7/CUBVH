@@ -64,7 +64,7 @@ class cuBVH():
         """Get the device this BVH is on."""
         return self._device
     
-    def to(self, device):
+    def to(self, device, *args, **kwargs):
         """Move the BVH to a different device."""
         if isinstance(device, str):
             device = torch.device(device)
