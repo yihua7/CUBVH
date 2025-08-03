@@ -169,5 +169,51 @@ def test_bvh_pickle():
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+def test_unsigned_distance():
+    """Test the unsigned_distance method of cuBVH."""
+
+    # Load mesh.ply from the test directory
+    mesh_path = './mesh.ply'
+    if not os.path.exists(mesh_path):
+        print(f"Error: {mesh_path} not found!")
+        return
+    
+    print(f"Loading mesh from {mesh_path}...")
+    mesh = trimesh.load(mesh_path, process=False)
+    vertices = mesh.vertices.astype(np.float32)
+    triangles = mesh.faces.astype(np.uint32)
+    
+    print(f"Mesh loaded: {len(vertices)} vertices, {len(triangles)} triangles")
+    
+    print("Creating cuBVH...")
+    bvh = cuBVH(vertices, triangles)
+    
+    # Test unsigned_distance with random points
+    print("Testing unsigned_distance with random points...")
+    n_points = 1000
+    torch.manual_seed(42)  # For reproducible results
+    points = torch.rand(n_points, 3, device='cuda') * 2 - 1  # Random points in [-1, 1]
+
+    temp_path = './bvh_unsigned_distance.pt'
+    print("Saving BVH with torch.save...")
+    torch.save(bvh, temp_path)
+    
+    distances, face_id, uvw = bvh.unsigned_distance(points, return_uvw=True)
+    print(f"Unsigned distances - mean: {distances.mean():.4f}, max: {distances.max():.4f}, min: {distances.min():.4f}")
+    
+    loaded_bvh = torch.load(temp_path, weights_only=False)
+    test_distances, test_face_id, test_uvw = loaded_bvh.unsigned_distance(points, return_uvw=True)
+
+    os.remove(temp_path)
+    
+    # Verify distances are non-negative
+    assert torch.all(test_distances >= 0), "Unsigned distances contain negative values!"
+    assert (test_distances - distances).abs().max() < 1e-6, "Test distances do not match original distances!"
+    assert torch.equal(test_face_id, face_id), "Test face IDs do not match original face IDs!"
+    assert (test_uvw - uvw).abs().max() < 1e-6, "Test UVW coordinates do not match original UVW coordinates!"
+    print("✅ Unsigned distance test passed!")
+
+
 if __name__ == "__main__":
     test_bvh_pickle()
+    test_unsigned_distance()
