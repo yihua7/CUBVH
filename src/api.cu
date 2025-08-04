@@ -28,8 +28,6 @@ public:
             triangles_cpu[i] = {vertices.row(triangles(i, 0)), vertices.row(triangles(i, 1)), vertices.row(triangles(i, 2)), (int64_t)i};
         }
 
-        triangles_gpu.resize_and_copy_from_host(triangles_cpu);
-
         if (build_bvh) {
             if (!triangle_bvh) {
                 triangle_bvh = TriangleBvh::make();
@@ -40,9 +38,7 @@ public:
             // Just create the BVH object without building
             triangle_bvh = TriangleBvh::make();
         }
-
-        // TODO: need OPTIX
-        // triangle_bvh->build_optix(triangles_gpu, m_inference_stream);
+        triangles_gpu.resize_and_copy_from_host(triangles_cpu);
 
     }
 
@@ -118,6 +114,57 @@ public:
         triangle_bvh->set_nodes(nodes);
     }
 
+    at::Tensor get_triangles() override {
+        size_t n_triangles = triangles_cpu.size();
+        
+        // Each triangle: [ax, ay, az, bx, by, bz, cx, cy, cz, id]
+        at::Tensor triangles_tensor = at::zeros({(int64_t)n_triangles, 10}, at::TensorOptions().dtype(torch::kFloat32));
+        float* data = triangles_tensor.data_ptr<float>();
+        
+        for (size_t i = 0; i < n_triangles; ++i) {
+            const auto& triangle = triangles_cpu[i];
+            data[i * 10 + 0] = triangle.a.x();
+            data[i * 10 + 1] = triangle.a.y();
+            data[i * 10 + 2] = triangle.a.z();
+            data[i * 10 + 3] = triangle.b.x();
+            data[i * 10 + 4] = triangle.b.y();
+            data[i * 10 + 5] = triangle.b.z();
+            data[i * 10 + 6] = triangle.c.x();
+            data[i * 10 + 7] = triangle.c.y();
+            data[i * 10 + 8] = triangle.c.z();
+            data[i * 10 + 9] = static_cast<float>(triangle.id);
+        }
+        
+        return triangles_tensor;
+    }
+    
+    void set_triangles(at::Tensor triangles_tensor) override {
+        TORCH_CHECK(triangles_tensor.dim() == 2 && triangles_tensor.size(1) == 10, 
+                   "Triangles tensor must have shape [N, 10]");
+        
+        triangles_tensor = triangles_tensor.contiguous().cpu();
+        float* data = triangles_tensor.data_ptr<float>();
+        size_t n_triangles = triangles_tensor.size(0);
+        
+        triangles_cpu.resize(n_triangles);
+        for (size_t i = 0; i < n_triangles; ++i) {
+            auto& triangle = triangles_cpu[i];
+            triangle.a.x() = data[i * 10 + 0];
+            triangle.a.y() = data[i * 10 + 1];
+            triangle.a.z() = data[i * 10 + 2];
+            triangle.b.x() = data[i * 10 + 3];
+            triangle.b.y() = data[i * 10 + 4];
+            triangle.b.z() = data[i * 10 + 5];
+            triangle.c.x() = data[i * 10 + 6];
+            triangle.c.y() = data[i * 10 + 7];
+            triangle.c.z() = data[i * 10 + 8];
+            triangle.id = static_cast<int64_t>(data[i * 10 + 9]);
+        }
+        
+        // Update GPU memory with new triangles
+        triangles_gpu.resize_and_copy_from_host(triangles_cpu);
+    }
+
     std::vector<Triangle> triangles_cpu;
     GPUMemory<Triangle> triangles_gpu;
     std::shared_ptr<TriangleBvh> triangle_bvh;
@@ -129,6 +176,13 @@ cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
 
 cuBVH* create_cuBVH_no_build(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
     return new cuBVHImpl{vertices, triangles, false};
+}
+
+cuBVH* create_cuBVH_from_data(Ref<const Verts> vertices, Ref<const Trigs> triangles, at::Tensor bvh_nodes, at::Tensor triangles_data) {
+    cuBVHImpl* impl = new cuBVHImpl{vertices, triangles, false};
+    impl->set_bvh_nodes(bvh_nodes);
+    impl->set_triangles(triangles_data);
+    return impl;
 }
 
 at::Tensor floodfill(at::Tensor grid) {

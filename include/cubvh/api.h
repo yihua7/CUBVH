@@ -25,6 +25,10 @@ public:
     // Methods for BVH node serialization
     virtual at::Tensor get_bvh_nodes() = 0;
     virtual void set_bvh_nodes(at::Tensor nodes_tensor) = 0;
+    
+    // Methods for triangle data serialization
+    virtual at::Tensor get_triangles() = 0;
+    virtual void set_triangles(at::Tensor triangles_tensor) = 0;
 };
 
 // function to create an implementation of cuBVH
@@ -32,6 +36,9 @@ cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles);
 
 // function to create an implementation of cuBVH without building BVH (for loading from saved state)
 cuBVH* create_cuBVH_no_build(Ref<const Verts> vertices, Ref<const Trigs> triangles);
+
+// function to create an implementation of cuBVH from saved BVH and triangle data
+cuBVH* create_cuBVH_from_data(Ref<const Verts> vertices, Ref<const Trigs> triangles, at::Tensor bvh_nodes, at::Tensor triangles_data);
 
 // floodfill
 at::Tensor floodfill(at::Tensor grid);

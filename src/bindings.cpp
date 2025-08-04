@@ -17,11 +17,15 @@ py::class_<cuBVH>(m, "cuBVH")
     .def("unsigned_distance", &cuBVH::unsigned_distance)
     .def("signed_distance", &cuBVH::signed_distance)
     .def("get_bvh_nodes", &cuBVH::get_bvh_nodes)
-    .def("set_bvh_nodes", &cuBVH::set_bvh_nodes);
+    .def("set_bvh_nodes", &cuBVH::set_bvh_nodes)
+    .def("get_triangles", &cuBVH::get_triangles)
+    .def("set_triangles", &cuBVH::set_triangles);
 
 m.def("create_cuBVH", &create_cuBVH);
 
 m.def("create_cuBVH_no_build", &create_cuBVH_no_build);
+
+m.def("create_cuBVH_from_data", &create_cuBVH_from_data);
 
 m.def("floodfill", &floodfill);
 

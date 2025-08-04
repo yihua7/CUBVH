@@ -10,10 +10,11 @@ _sdf_mode_to_id = {
 }
 
 class cuBVH():
-    def __init__(self, vertices, triangles, bvh_nodes=None, device=None):
+    def __init__(self, vertices, triangles, bvh_nodes=None, triangles_data=None, device=None):
         # vertices: np.ndarray, [N, 3]
         # triangles: np.ndarray, [M, 3]
         # bvh_nodes: torch.Tensor, [N, 8], optional pre-computed BVH nodes
+        # triangles_data: torch.Tensor, [M, 10], optional pre-computed sorted triangles
         # device: torch.device or str, device to create the BVH on
 
         if torch.is_tensor(vertices): vertices = vertices.detach().cpu().numpy()
@@ -48,16 +49,29 @@ class cuBVH():
             # implementation
             self.impl = _backend.create_cuBVH(vertices, triangles)
             
-            # If BVH nodes are provided, set them directly instead of rebuilding
-            if bvh_nodes is not None:
-                # Ensure BVH nodes are on the correct device
+            # If BVH nodes and triangles data are provided, set them directly instead of rebuilding
+            if bvh_nodes is not None and triangles_data is not None:
+                # Ensure data is on the correct device
+                if bvh_nodes.device != self._device:
+                    bvh_nodes = bvh_nodes.to(self._device)
+                if triangles_data.device != self._device:
+                    triangles_data = triangles_data.to(self._device)
+                
+                self.impl.set_bvh_nodes(bvh_nodes)
+                self.impl.set_triangles(triangles_data)
+                self._bvh_nodes = bvh_nodes
+                self._triangles_data = triangles_data
+            elif bvh_nodes is not None:
+                # Only BVH nodes provided
                 if bvh_nodes.device != self._device:
                     bvh_nodes = bvh_nodes.to(self._device)
                 self.impl.set_bvh_nodes(bvh_nodes)
                 self._bvh_nodes = bvh_nodes
+                self._triangles_data = self.impl.get_triangles()
             else:
-                # Get the BVH nodes that were built during construction
+                # Get the BVH nodes and triangles that were built during construction
                 self._bvh_nodes = self.impl.get_bvh_nodes()
+                self._triangles_data = self.impl.get_triangles()
 
     @property
     def device(self):
@@ -75,14 +89,16 @@ class cuBVH():
         if device == self._device:
             return self  # Already on the target device
         
-        # Create a new BVH on the target device using the saved BVH nodes
+        # Create a new BVH on the target device using the saved BVH nodes and triangles
         with torch.cuda.device(device):
             # Create new implementation on target device
             new_impl = _backend.create_cuBVH_no_build(self._vertices, self._triangles)
             
-            # Move BVH nodes to target device and set them
+            # Move BVH nodes and triangles to target device and set them
             bvh_nodes_on_device = self._bvh_nodes.to(device)
+            triangles_data_on_device = self._triangles_data.to(device)
             new_impl.set_bvh_nodes(bvh_nodes_on_device)
+            new_impl.set_triangles(triangles_data_on_device)
             
             # Create new cuBVH instance
             new_bvh = cuBVH.__new__(cuBVH)
@@ -91,6 +107,7 @@ class cuBVH():
             new_bvh._device = device
             new_bvh.impl = new_impl
             new_bvh._bvh_nodes = bvh_nodes_on_device
+            new_bvh._triangles_data = triangles_data_on_device
             
             return new_bvh
 
@@ -194,12 +211,41 @@ class cuBVH():
 
         return distances, face_id, uvw
 
+    def get_bvh_nodes(self):
+        """Get the BVH nodes as a tensor."""
+        return self._bvh_nodes.clone()
+    
+    def get_triangles_data(self):
+        """Get the sorted triangles data as a tensor."""
+        return self._triangles_data.clone()
+    
+    def get_sorted_triangles(self):
+        """Get the sorted triangles as vertices and triangle indices.
+        
+        Returns:
+            vertices: torch.Tensor, [N, 3] - all vertex positions
+            triangles: torch.Tensor, [M, 3] - triangle vertex indices  
+            triangle_ids: torch.Tensor, [M] - original triangle IDs
+        """
+        triangles_data = self._triangles_data
+        n_triangles = triangles_data.shape[0]
+        
+        # Extract vertices from triangles data (each triangle has 3 vertices)
+        vertices = triangles_data[:, :9].view(n_triangles * 3, 3)  # [M*3, 3]
+        triangle_ids = triangles_data[:, 9].long()  # [M]
+        
+        # Create triangle indices
+        triangles = torch.arange(n_triangles * 3, device=self._device, dtype=torch.long).view(n_triangles, 3)
+        
+        return vertices, triangles, triangle_ids
+
     def __getstate__(self):
         # Return the state for pickling (exclude the C++ impl object)
         return {
             'vertices': self._vertices,
             'triangles': self._triangles,
             'bvh_nodes': self._bvh_nodes.cpu(),  # Save BVH nodes on CPU for portability
+            'triangles_data': self._triangles_data.cpu(),  # Save sorted triangles on CPU for portability
             'device': self._device
         }
     
@@ -209,14 +255,23 @@ class cuBVH():
         self._triangles = state['triangles']
         self._device = state.get('device', torch.device('cuda:0'))  # Default to cuda:0 for backward compatibility
         
-        # Move BVH nodes to the target device
+        # Move BVH nodes and triangles to the target device
         bvh_nodes = state['bvh_nodes'].to(self._device)
+        triangles_data = state.get('triangles_data')  # May not exist in old saves
         self._bvh_nodes = bvh_nodes
         
         with torch.cuda.device(self._device):
-            # Create the impl without building BVH, then set the saved BVH nodes directly
+            # Create the impl without building BVH, then set the saved data directly
             self.impl = _backend.create_cuBVH_no_build(self._vertices, self._triangles)
             self.impl.set_bvh_nodes(bvh_nodes)
+            
+            if triangles_data is not None:
+                triangles_data = triangles_data.to(self._device)
+                self.impl.set_triangles(triangles_data)
+                self._triangles_data = triangles_data
+            else:
+                # For backward compatibility, get triangles from the current state
+                self._triangles_data = self.impl.get_triangles()
 
 def floodfill(grid):
     # grid: torch.Tensor, uint8, [B, H, W, D] or [H, W, D]

@@ -193,6 +193,7 @@ def test_unsigned_distance():
     n_points = 1000
     torch.manual_seed(42)  # For reproducible results
     points = torch.rand(n_points, 3, device='cuda') * 2 - 1  # Random points in [-1, 1]
+    points = points * np.abs(vertices).max()
 
     temp_path = './bvh_unsigned_distance.pt'
     print("Saving BVH with torch.save...")
@@ -201,8 +202,13 @@ def test_unsigned_distance():
     distances, face_id, uvw = bvh.unsigned_distance(points, return_uvw=True)
     print(f"Unsigned distances - mean: {distances.mean():.4f}, max: {distances.max():.4f}, min: {distances.min():.4f}")
     
+    distances_sdf, face_id_sdf, uvw_sdf = bvh.signed_distance(points, return_uvw=True, mode='watertight')
+    
     loaded_bvh = torch.load(temp_path, weights_only=False)
+
     test_distances, test_face_id, test_uvw = loaded_bvh.unsigned_distance(points, return_uvw=True)
+
+    test_distances_sdf, test_face_id_sdf, test_uvw_sdf = loaded_bvh.signed_distance(points, return_uvw=True, mode='watertight')
 
     os.remove(temp_path)
     
@@ -211,7 +217,12 @@ def test_unsigned_distance():
     assert (test_distances - distances).abs().max() < 1e-6, "Test distances do not match original distances!"
     assert torch.equal(test_face_id, face_id), "Test face IDs do not match original face IDs!"
     assert (test_uvw - uvw).abs().max() < 1e-6, "Test UVW coordinates do not match original UVW coordinates!"
+    assert (test_distances_sdf - distances_sdf).abs().max() < 1e-6, "Test signed distances do not match original signed distances!"
+    assert torch.equal(test_face_id_sdf, face_id_sdf), "Test signed face IDs do not match original signed face IDs!"
+    assert (test_uvw_sdf - uvw_sdf).abs().max() < 1e-6, "Test signed UVW coordinates do not match original signed UVW coordinates!"
     print("✅ Unsigned distance test passed!")
+
+    print(f'USF, SDF distances: {(distances - distances_sdf.abs()).max():.4f}, Face IDs: {torch.equal(face_id, face_id_sdf)}, UVW: {(uvw - uvw_sdf).max():.4f}')
 
 
 if __name__ == "__main__":
