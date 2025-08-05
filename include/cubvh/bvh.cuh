@@ -75,6 +75,11 @@ public:
         m_nodes = nodes;
         m_nodes_gpu.resize_and_copy_from_host(m_nodes);
     }
+    
+    // Method to explicitly free GPU memory
+    void free_gpu_memory() {
+        m_nodes_gpu.free();
+    }
 };
 
 }

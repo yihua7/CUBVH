@@ -239,6 +239,19 @@ class cuBVH():
         
         return vertices, triangles, triangle_ids
 
+    def free_memory(self):
+        """Explicitly free GPU memory used by this BVH."""
+        if hasattr(self, 'impl') and self.impl is not None:
+            self.impl.free_memory()
+    
+    def __del__(self):
+        """Destructor to ensure GPU memory is freed."""
+        try:
+            self.free_memory()
+        except:
+            # Ignore errors during destruction (e.g., if CUDA context is already destroyed)
+            pass
+
     def __getstate__(self):
         # Return the state for pickling (exclude the C++ impl object)
         return {

@@ -68,8 +68,17 @@ public:
     GPUMemory() {}
 
     GPUMemory<T>& operator=(GPUMemory<T>&& other) {
-        std::swap(m_data, other.m_data);
-        std::swap(m_size, other.m_size);
+        if (this != &other) {
+            // Free our current memory if we own it
+            if (m_owned && m_data) {
+                free_memory();
+            }
+            
+            // Take ownership of other's data
+            std::swap(m_data, other.m_data);
+            std::swap(m_size, other.m_size);
+            std::swap(m_owned, other.m_owned);
+        }
         return *this;
     }
 
@@ -77,7 +86,24 @@ public:
         *this = std::move(other);
     }
 
+    // Copy constructor - creates a non-owning view
     __host__ __device__ GPUMemory(const GPUMemory<T> &other) : m_data{other.m_data}, m_size{other.m_size}, m_owned{false} {}
+    
+    // Copy assignment operator - creates a non-owning view
+    GPUMemory<T>& operator=(const GPUMemory<T> &other) {
+        if (this != &other) {
+            // Free our current memory if we own it
+            if (m_owned && m_data) {
+                free_memory();
+            }
+            
+            // Create a non-owning view of other's data
+            m_data = other.m_data;
+            m_size = other.m_size;
+            m_owned = false;
+        }
+        return *this;
+    }
 
     void check_guards() const {
 #if DEBUG_GUARD_SIZE > 0
@@ -125,11 +151,21 @@ public:
 
         uint8_t *rawptr = (uint8_t*)m_data;
         if (rawptr) rawptr-=DEBUG_GUARD_SIZE;
+        
+        size_t bytes_to_free = get_bytes();
         CUDA_CHECK_THROW(cudaFree(rawptr));
 
-        total_n_bytes_allocated() -= get_bytes();
+        total_n_bytes_allocated() -= bytes_to_free;
 
         m_data = nullptr;
+    }
+    
+    /// Explicitly free the memory (useful for manual memory management)
+    void free() {
+        if (m_owned && m_data) {
+            free_memory();
+            m_size = 0;
+        }
     }
 
     /// Allocates memory for size items of type T
@@ -140,15 +176,13 @@ public:
     /// Frees memory again
     __host__ __device__ ~GPUMemory() {
 #ifndef __CUDA_ARCH__
-        if (!m_owned) {
+        if (!m_owned || !m_data) {
             return;
         }
 
         try {
-            if (m_data) {
-                free_memory();
-                m_size = 0;
-            }
+            free_memory();
+            m_size = 0;
         } catch (std::runtime_error error) {
             // Don't need to report on memory-free problems when the driver is shutting down.
             if (std::string{error.what()}.find("driver shutting down") == std::string::npos) {

@@ -29,6 +29,9 @@ public:
     // Methods for triangle data serialization
     virtual at::Tensor get_triangles() = 0;
     virtual void set_triangles(at::Tensor triangles_tensor) = 0;
+    
+    // Method to explicitly free GPU memory
+    virtual void free_memory() = 0;
 };
 
 // function to create an implementation of cuBVH

@@ -19,7 +19,8 @@ py::class_<cuBVH>(m, "cuBVH")
     .def("get_bvh_nodes", &cuBVH::get_bvh_nodes)
     .def("set_bvh_nodes", &cuBVH::set_bvh_nodes)
     .def("get_triangles", &cuBVH::get_triangles)
-    .def("set_triangles", &cuBVH::set_triangles);
+    .def("set_triangles", &cuBVH::set_triangles)
+    .def("free_memory", &cuBVH::free_memory);
 
 m.def("create_cuBVH", &create_cuBVH);
 

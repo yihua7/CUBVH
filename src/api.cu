@@ -164,6 +164,16 @@ public:
         // Update GPU memory with new triangles
         triangles_gpu.resize_and_copy_from_host(triangles_cpu);
     }
+    
+    void free_memory() override {
+        // Explicitly free GPU memory
+        triangles_gpu.free();
+        
+        // Free BVH nodes GPU memory if available
+        if (triangle_bvh) {
+            triangle_bvh->free_gpu_memory();
+        }
+    }
 
     std::vector<Triangle> triangles_cpu;
     GPUMemory<Triangle> triangles_gpu;
