@@ -266,7 +266,7 @@ class cuBVH():
         # Restore the state from pickling (rebuild the C++ impl object)
         self._vertices = state['vertices']
         self._triangles = state['triangles']
-        self._device = state.get('device', torch.device('cuda:0'))  # Default to cuda:0 for backward compatibility
+        # self._device = state.get('device', torch.device('cuda:0'))  # Default to cuda:0 for backward compatibility
         
         # Move BVH nodes and triangles to the target device
         bvh_nodes = state['bvh_nodes'].to(self._device)
