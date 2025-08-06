@@ -63,7 +63,7 @@ def test_cpu_loading():
     
     # Step 3: Load BVH (should be on CPU)
     print("\nStep 3: Loading BVH with torch.load...")
-    loaded_bvh = torch.load(temp_filename)
+    loaded_bvh = torch.load(temp_filename, weights_only=False)
     
     after_load_memory = torch.cuda.memory_allocated() / (1024 * 1024)
     print(f"GPU memory after loading: {after_load_memory:.2f} MB")
@@ -109,7 +109,7 @@ def test_cpu_loading():
     torch.cuda.empty_cache()
     lazy_memory_start = torch.cuda.memory_allocated() / (1024 * 1024)
     
-    lazy_bvh = torch.load(temp_filename)
+    lazy_bvh = torch.load(temp_filename, weights_only=False)
     lazy_memory_after_load = torch.cuda.memory_allocated() / (1024 * 1024)
     print(f"Lazy: GPU memory after load: {lazy_memory_after_load:.2f} MB")
     
