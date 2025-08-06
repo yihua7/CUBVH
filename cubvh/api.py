@@ -96,9 +96,11 @@ class cuBVH():
             
             # Move BVH nodes and triangles to target device and set them
             bvh_nodes_on_device = self._bvh_nodes.to(device)
-            triangles_data_on_device = self._triangles_data.to(device)
+            triangles_data_on_device = self._triangles_data.to(device) if self._triangles_data is not None else None
+            
             new_impl.set_bvh_nodes(bvh_nodes_on_device)
-            new_impl.set_triangles(triangles_data_on_device)
+            if triangles_data_on_device is not None:
+                new_impl.set_triangles(triangles_data_on_device)
             
             # Create new cuBVH instance
             new_bvh = cuBVH.__new__(cuBVH)
@@ -107,13 +109,38 @@ class cuBVH():
             new_bvh._device = device
             new_bvh.impl = new_impl
             new_bvh._bvh_nodes = bvh_nodes_on_device
-            new_bvh._triangles_data = triangles_data_on_device
+            new_bvh._triangles_data = triangles_data_on_device if triangles_data_on_device is not None else new_impl.get_triangles()
             
             return new_bvh
+
+    def _ensure_impl(self):
+        """Ensure the C++ implementation is created and ready for use."""
+        if self.impl is None:
+            if self._device.type != 'cuda':
+                raise RuntimeError("cuBVH implementation requires a CUDA device. Use .to('cuda') to move to GPU first.")
+            
+            with torch.cuda.device(self._device):
+                # Create the impl without building BVH, then set the saved data directly
+                self.impl = _backend.create_cuBVH_no_build(self._vertices, self._triangles)
+                
+                # Move data to device and set it
+                bvh_nodes = self._bvh_nodes.to(self._device)
+                self.impl.set_bvh_nodes(bvh_nodes)
+                self._bvh_nodes = bvh_nodes
+                
+                if self._triangles_data is not None:
+                    triangles_data = self._triangles_data.to(self._device)
+                    self.impl.set_triangles(triangles_data)
+                    self._triangles_data = triangles_data
+                else:
+                    # For backward compatibility, get triangles from the current state
+                    self._triangles_data = self.impl.get_triangles()
 
     def ray_trace(self, rays_o, rays_d):
         # rays_o: torch.Tensor, float, [N, 3]
         # rays_d: torch.Tensor, float, [N, 3]
+
+        self._ensure_impl()  # Ensure GPU implementation is ready
 
         rays_o = rays_o.float().contiguous()
         rays_d = rays_d.float().contiguous()
@@ -146,6 +173,8 @@ class cuBVH():
 
     def unsigned_distance(self, positions, return_uvw=False):
         # positions: torch.Tensor, float, [N, 3]
+
+        self._ensure_impl()  # Ensure GPU implementation is ready
 
         positions = positions.float().contiguous()
 
@@ -180,6 +209,8 @@ class cuBVH():
     
     def signed_distance(self, positions, return_uvw=False, mode='watertight'):
         # positions: torch.Tensor, float, [N, 3]
+
+        self._ensure_impl()  # Ensure GPU implementation is ready
 
         positions = positions.float().contiguous()
 
@@ -243,6 +274,8 @@ class cuBVH():
         """Explicitly free GPU memory used by this BVH."""
         if hasattr(self, 'impl') and self.impl is not None:
             self.impl.free_memory()
+            # Reset impl to None so it can be recreated if needed
+            self.impl = None
     
     def __del__(self):
         """Destructor to ensure GPU memory is freed."""
@@ -266,25 +299,29 @@ class cuBVH():
         # Restore the state from pickling (rebuild the C++ impl object)
         self._vertices = state['vertices']
         self._triangles = state['triangles']
-        # self._device = state.get('device', torch.device('cuda:0'))  # Default to cuda:0 for backward compatibility
         
-        # Move BVH nodes and triangles to the target device
-        bvh_nodes = state['bvh_nodes'].to(self._device)
+        # Default to CPU when loading to avoid automatic GPU allocation
+        # User can later move to GPU with .to(device) if needed
+        if torch.cuda.is_available():
+            self._device = torch.device('cpu')
+        else:
+            self._device = torch.device('cpu')
+
+        # Keep BVH nodes and triangles on CPU initially
+        bvh_nodes = state['bvh_nodes']  # Keep on CPU
         triangles_data = state.get('triangles_data')  # May not exist in old saves
         self._bvh_nodes = bvh_nodes
         
-        with torch.cuda.device(self._device):
-            # Create the impl without building BVH, then set the saved data directly
-            self.impl = _backend.create_cuBVH_no_build(self._vertices, self._triangles)
-            self.impl.set_bvh_nodes(bvh_nodes)
-            
-            if triangles_data is not None:
-                triangles_data = triangles_data.to(self._device)
-                self.impl.set_triangles(triangles_data)
-                self._triangles_data = triangles_data
-            else:
-                # For backward compatibility, get triangles from the current state
-                self._triangles_data = self.impl.get_triangles()
+        # Note: We can't create the C++ impl on CPU since cuBVH requires CUDA
+        # So we defer the creation until the user explicitly moves to a CUDA device
+        # or calls a method that requires GPU computation
+        self.impl = None
+        
+        if triangles_data is not None:
+            self._triangles_data = triangles_data  # Keep on CPU
+        else:
+            # For backward compatibility, we'll create triangles_data when impl is created
+            self._triangles_data = None
 
 def floodfill(grid):
     # grid: torch.Tensor, uint8, [B, H, W, D] or [H, W, D]
