@@ -21,7 +21,12 @@ struct Triangle {
     }
 
     __host__ __device__ Eigen::Vector3f normal() const {
-        return (b - a).cross(c - a).normalized();
+        Eigen::Vector3f n = (b - a).cross(c - a);
+        float norm = n.norm();
+        if (norm > 1e-12f) {
+            return n / norm;
+        }
+        return Eigen::Vector3f::Zero();
     }
 
     __host__ __device__ float ray_intersect(const Eigen::Vector3f &ro, const Eigen::Vector3f &rd, Eigen::Vector3f& n) const { // based on https://www.iquilezles.org/www/articles/intersectors/intersectors.htm
@@ -106,13 +111,25 @@ struct Triangle {
     }
 
     __host__ __device__ Eigen::Vector3f closest_point_to_line(const Eigen::Vector3f& a, const Eigen::Vector3f& b, const Eigen::Vector3f& c) const {
-        float t = (c - a).dot(b - a) / (b - a).dot(b - a);
-        t = std::max(std::min(t, 1.0f), 0.0f);
-        return a + t * (b - a);
+        Eigen::Vector3f ab = b - a;
+        float denom = ab.squaredNorm();
+        if (denom <= 1e-12f) {
+            return a;
+        }
+        float t = (c - a).dot(ab) / denom;
+        t = clamp(t, 0.0f, 1.0f);
+        return a + t * ab;
     }
 
     __host__ __device__ Eigen::Vector3f closest_point(Eigen::Vector3f point) const {
-        point -= normal().dot(point - a) * normal();
+        Eigen::Vector3f ab = b - a;
+        Eigen::Vector3f ac = c - a;
+        Eigen::Vector3f n = ab.cross(ac);
+        float norm_sq = n.squaredNorm();
+        if (norm_sq > 1e-12f) {
+            float dist = n.dot(point - a) / norm_sq;
+            point -= dist * n;
+        }
 
         if (point_in_triangle(point)) {
             return point;
@@ -150,10 +167,31 @@ struct Triangle {
         float d21 = v2.dot(v1);
 
         float denom = d00 * d11 - d01 * d01;
+        if (fabsf(denom) < 1e-12f) {
+            float ab = (b - a).squaredNorm();
+            float bc = (c - b).squaredNorm();
+            float ca = (a - c).squaredNorm();
+            const float eps = 1e-12f;
+
+            if (ab >= bc && ab >= ca && ab > eps) {
+                float t = clamp((p - a).dot(b - a) / ab, 0.0f, 1.0f);
+                return Eigen::Vector3f(1.0f - t, t, 0.0f);
+            }
+            if (bc >= ca && bc > eps) {
+                float t = clamp((p - b).dot(c - b) / bc, 0.0f, 1.0f);
+                return Eigen::Vector3f(0.0f, 1.0f - t, t);
+            }
+            if (ca > eps) {
+                float t = clamp((p - c).dot(a - c) / ca, 0.0f, 1.0f);
+                return Eigen::Vector3f(t, 0.0f, 1.0f - t);
+            }
+            return Eigen::Vector3f(1.0f, 0.0f, 0.0f);
+        }
+
         float v = (d11 * d20 - d01 * d21) / denom;
         float w = (d00 * d21 - d01 * d20) / denom;
-        float u = 1.0 - v - w;
-        
+        float u = 1.0f - v - w;
+
         return Eigen::Vector3f(u, v, w);
     }
 
