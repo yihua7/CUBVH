@@ -20,7 +20,7 @@ struct TriangleBvhNode {
 };
 
 
-template <typename T, int MAX_SIZE=32>
+template <typename T, int MAX_SIZE=64>
 class FixedStack {
 public:
     __host__ __device__ void push(T val) {

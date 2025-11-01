@@ -8,6 +8,7 @@
 #include <iostream>
 #include <cstdio>
 #include <functional>
+#include <limits>
 
 using namespace Eigen;
 using namespace cubvh;
@@ -272,19 +273,34 @@ public:
             } else {
                 DistAndIdx children[BRANCHING_FACTOR];
 
-                uint32_t first_child = node.left_idx;
+                int first_child = node.left_idx;
+                int end_child = node.right_idx;
+                int child_count = end_child - first_child;
+
+                if (child_count <= 0 || child_count > static_cast<int>(BRANCHING_FACTOR)) {
+                    return ray_intersect_stackless(ro, rd, bvhnodes, triangles);
+                }
 
                 #pragma unroll
                 for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
-                    children[i] = {bvhnodes[i+first_child].bb.ray_intersect(ro, rd).x(), i+first_child};
+                    int child_idx = first_child + static_cast<int>(i);
+                    if (child_idx < end_child) {
+                        children[i] = {bvhnodes[child_idx].bb.ray_intersect(ro, rd).x(), static_cast<uint32_t>(child_idx)};
+                    } else {
+                        children[i] = {std::numeric_limits<float>::infinity(), UINT32_MAX};
+                    }
                 }
 
                 sorting_network<BRANCHING_FACTOR>(children);
 
                 #pragma unroll
                 for (int i = (int)BRANCHING_FACTOR - 1; i >= 0; --i) {
+                    uint32_t child_idx = children[i].idx;
+                    if (child_idx == UINT32_MAX) {
+                        continue;
+                    }
                     if (children[i].dist < mint) {
-                        query_stack.push(children[i].idx);
+                        query_stack.push(static_cast<int>(child_idx));
                     }
                 }
             }
@@ -322,19 +338,34 @@ public:
             } else {
                 DistAndIdx children[BRANCHING_FACTOR];
 
-                uint32_t first_child = node.left_idx;
+                int first_child = node.left_idx;
+                int end_child = node.right_idx;
+                int child_count = end_child - first_child;
+
+                if (child_count <= 0 || child_count > static_cast<int>(BRANCHING_FACTOR)) {
+                    return closest_triangle_stackless(point, bvhnodes, triangles, shortest_distance_sq);
+                }
 
                 #pragma unroll
                 for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
-                    children[i] = {bvhnodes[i+first_child].bb.distance_sq(point), i+first_child};
+                    int child_idx = first_child + static_cast<int>(i);
+                    if (child_idx < end_child) {
+                        children[i] = {bvhnodes[child_idx].bb.distance_sq(point), static_cast<uint32_t>(child_idx)};
+                    } else {
+                        children[i] = {std::numeric_limits<float>::infinity(), UINT32_MAX};
+                    }
                 }
 
                 sorting_network<BRANCHING_FACTOR>(children);
 
                 #pragma unroll
                 for (int i = (int)BRANCHING_FACTOR - 1; i >= 0; --i) {
+                    uint32_t child_idx = children[i].idx;
+                    if (child_idx == UINT32_MAX) {
+                        continue;
+                    }
                     if (children[i].dist <= shortest_distance_sq) {
-                        query_stack.push(children[i].idx);
+                        query_stack.push(static_cast<int>(child_idx));
                     }
                 }
             }
@@ -378,12 +409,12 @@ public:
                     }
                 }
             } else {
-                uint32_t first_child = node.left_idx;
+                int first_child = node.left_idx;
+                int end_child = node.right_idx;
 
-                #pragma unroll
-                for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
-                    if (bvhnodes[i+first_child].bb.distance_sq(point) < EPSILON) {
-                        query_stack.push(i+first_child);
+                for (int child_idx = first_child; child_idx < end_child; ++child_idx) {
+                    if (bvhnodes[child_idx].bb.distance_sq(point) < EPSILON) {
+                        query_stack.push(child_idx);
                     }
                 }
             }
@@ -622,6 +653,48 @@ const std::vector<TriangleBvhNode>& TriangleBvh::host_nodes() const {
 
 void TriangleBvh::set_nodes(const std::vector<TriangleBvhNode>& nodes) {
     m_nodes = nodes;
+
+    if (!m_nodes.empty()) {
+        for (auto& node : m_nodes) {
+            node.escape_idx = -1;
+        }
+
+        std::function<void(int, int)> thread_bvh = [&](int node_idx, int escape_idx) {
+            if (node_idx < 0 || node_idx >= static_cast<int>(m_nodes.size())) {
+                return;
+            }
+
+            TriangleBvhNode& node = m_nodes[node_idx];
+            node.escape_idx = escape_idx;
+
+            if (node.left_idx < 0) {
+                return;
+            }
+
+            int first_child = node.left_idx;
+            int end_child = node.right_idx;
+
+            if (first_child < 0 || first_child >= static_cast<int>(m_nodes.size())) {
+                return;
+            }
+
+            if (end_child <= first_child) {
+                return;
+            }
+
+            if (end_child > static_cast<int>(m_nodes.size())) {
+                end_child = static_cast<int>(m_nodes.size());
+            }
+
+            for (int c = first_child; c < end_child; ++c) {
+                int next_escape = (c + 1 < end_child) ? (c + 1) : escape_idx;
+                thread_bvh(c, next_escape);
+            }
+        };
+
+        thread_bvh(0, -1);
+    }
+
     m_nodes_gpu.resize_and_copy_from_host(m_nodes);
 }
 

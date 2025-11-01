@@ -18,6 +18,8 @@ class cuBVH:
         self._impl = None
         self._impl_device = None
         self._state = None
+        self._exhaustive = None
+        self._is_exhaustive = False
         self.device = torch.device('cpu')
 
         target_device = self._parse_device(device)
@@ -43,36 +45,86 @@ class cuBVH:
 
     def _build_from_mesh(self, vertices, triangles, build_device):
         if torch.is_tensor(vertices):
-            vertices = vertices.detach().cpu().numpy()
+            vertices_arr = vertices.detach().cpu().numpy()
+        else:
+            vertices_arr = np.asarray(vertices, dtype=np.float32)
+
         if torch.is_tensor(triangles):
-            triangles = triangles.detach().cpu().numpy()
+            triangles_arr = triangles.detach().cpu().numpy()
+        else:
+            triangles_arr = np.asarray(triangles, dtype=np.int32)
 
-        assert triangles.shape[0] > 8, "BVH needs at least 8 triangles."
+        vertices_arr = np.asarray(vertices_arr, dtype=np.float32)
+        triangles_arr = np.asarray(triangles_arr, dtype=np.int32)
 
-        if build_device.type != 'cuda':
-            tri_pos, tri_ids, node_mins, node_maxs, node_children = _backend.build_cuBVH_state(vertices, triangles)
-            self._state = {
-                "triangles": tri_pos.detach().clone().cpu().contiguous(),
-                "triangle_ids": tri_ids.detach().clone().cpu().contiguous(),
-                "node_mins": node_mins.detach().clone().cpu().contiguous(),
-                "node_maxs": node_maxs.detach().clone().cpu().contiguous(),
-                "node_children": node_children.detach().clone().cpu().contiguous(),
-            }
-            self._impl = None
-            self._impl_device = None
-            self.device = torch.device('cpu')
+        if triangles_arr.shape[0] == 0:
+            raise ValueError("cuBVH requires at least one triangle.")
+
+        if triangles_arr.shape[0] < 8:
+            self._build_exhaustive(vertices_arr, triangles_arr)
             return
 
-        with self._cuda_device_guard(build_device):
-            self._impl = _backend.create_cuBVH(vertices, triangles)
-            self._impl_device = build_device
-            self.device = build_device
-            self._state = self._pull_state_from_impl()
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is required to build a cuBVH from mesh data.")
+
+        if build_device.type == 'cuda':
+            build_cuda = build_device
+        else:
+            index = torch.cuda.current_device()
+            build_cuda = torch.device('cuda', index)
+
+        with self._cuda_device_guard(build_cuda):
+            impl = _backend.create_cuBVH(vertices_arr, triangles_arr)
+            tri_pos, tri_ids, node_mins, node_maxs, node_children = impl.export_state()
+
+        self._state = {
+            "mode": torch.tensor(0, dtype=torch.int32),
+            "triangles": tri_pos.detach().clone().cpu().contiguous(),
+            "triangle_ids": tri_ids.detach().clone().cpu().contiguous(),
+            "node_mins": node_mins.detach().clone().cpu().contiguous(),
+            "node_maxs": node_maxs.detach().clone().cpu().contiguous(),
+            "node_children": node_children.detach().clone().cpu().contiguous(),
+        }
+
+        self._impl = impl
+        self._impl_device = build_cuda
+        self._is_exhaustive = False
+        self.device = build_cuda
+
+    def _build_exhaustive(self, vertices_arr, triangles_arr):
+        vertices_tensor = torch.as_tensor(vertices_arr, dtype=torch.float32).contiguous().clone()
+        faces_tensor = torch.as_tensor(triangles_arr, dtype=torch.long).contiguous().clone()
+        tri_positions = torch.as_tensor(vertices_arr[triangles_arr], dtype=torch.float32).contiguous().clone()
+        triangle_ids = torch.arange(triangles_arr.shape[0], dtype=torch.long).contiguous()
+        node_mins = torch.zeros((0, 3), dtype=torch.float32)
+        node_maxs = torch.zeros((0, 3), dtype=torch.float32)
+        node_children = torch.zeros((0, 2), dtype=torch.int32)
+
+        self._state = {
+            "mode": torch.tensor(1, dtype=torch.int32),
+            "vertices": vertices_tensor,
+            "faces": faces_tensor,
+            "triangles": tri_positions,
+            "triangle_ids": triangle_ids,
+            "node_mins": node_mins,
+            "node_maxs": node_maxs,
+            "node_children": node_children,
+        }
+
+        self._exhaustive = ExaustiveSearcher(vertices_tensor, faces_tensor, torch.device('cpu'))
+        self._impl = None
+        self._impl_device = None
+        self._is_exhaustive = True
+        self.device = torch.device('cpu')
 
     def _pull_state_from_impl(self):
+        if self._is_exhaustive:
+            return {key: value.clone() for key, value in self._state.items()}
+
         with self._cuda_device_guard(self._impl_device):
             tri_pos, tri_ids, node_mins, node_maxs, node_children = self._impl.export_state()
         return {
+            "mode": torch.tensor(0, dtype=torch.int32),
             "triangles": tri_pos.detach().clone().cpu().contiguous(),
             "triangle_ids": tri_ids.detach().clone().cpu().contiguous(),
             "node_mins": node_mins.detach().clone().cpu().contiguous(),
@@ -81,12 +133,73 @@ class cuBVH:
         }
 
     def _load_state(self, state):
+        mode_value = state.get("mode", None)
+        if mode_value is None:
+            mode_tensor = torch.tensor(0, dtype=torch.int32)
+        else:
+            mode_tensor = torch.as_tensor(mode_value, dtype=torch.int32, device='cpu').contiguous().clone()
+
+        mode = int(mode_tensor.item())
+
+        if mode == 1:
+            required = {"vertices", "faces"}
+            missing = required.difference(state.keys())
+            if missing:
+                raise ValueError(f"Serialized state is missing keys for exhaustive mode: {sorted(missing)}")
+
+            vertices = torch.as_tensor(state["vertices"], dtype=torch.float32, device='cpu').contiguous().clone()
+            faces = torch.as_tensor(state["faces"], dtype=torch.long, device='cpu').contiguous().clone()
+            triangles = torch.as_tensor(
+                state.get("triangles", vertices[faces]),
+                dtype=torch.float32,
+                device='cpu',
+            ).contiguous().clone()
+            triangle_ids = torch.as_tensor(
+                state.get("triangle_ids", torch.arange(faces.shape[0], dtype=torch.long)),
+                dtype=torch.long,
+                device='cpu',
+            ).contiguous().clone()
+            node_mins = torch.as_tensor(
+                state.get("node_mins", torch.empty((0, 3), dtype=torch.float32)),
+                dtype=torch.float32,
+                device='cpu',
+            ).contiguous().clone()
+            node_maxs = torch.as_tensor(
+                state.get("node_maxs", torch.empty((0, 3), dtype=torch.float32)),
+                dtype=torch.float32,
+                device='cpu',
+            ).contiguous().clone()
+            node_children = torch.as_tensor(
+                state.get("node_children", torch.empty((0, 2), dtype=torch.int32)),
+                dtype=torch.int32,
+                device='cpu',
+            ).contiguous().clone()
+
+            self._state = {
+                "mode": mode_tensor,
+                "vertices": vertices,
+                "faces": faces,
+                "triangles": triangles,
+                "triangle_ids": triangle_ids,
+                "node_mins": node_mins,
+                "node_maxs": node_maxs,
+                "node_children": node_children,
+            }
+
+            self._impl = None
+            self._impl_device = None
+            self._is_exhaustive = True
+            self._exhaustive = ExaustiveSearcher(vertices, faces, torch.device('cpu'))
+            self.device = torch.device('cpu')
+            return
+
         required = {"triangles", "triangle_ids", "node_mins", "node_maxs", "node_children"}
         missing = required.difference(state.keys())
         if missing:
             raise ValueError(f"Serialized state is missing keys: {sorted(missing)}")
 
         self._state = {
+            "mode": mode_tensor,
             "triangles": torch.as_tensor(state["triangles"], dtype=torch.float32, device='cpu').contiguous().clone(),
             "triangle_ids": torch.as_tensor(state["triangle_ids"], dtype=torch.long, device='cpu').contiguous().clone(),
             "node_mins": torch.as_tensor(state["node_mins"], dtype=torch.float32, device='cpu').contiguous().clone(),
@@ -96,6 +209,8 @@ class cuBVH:
 
         self._impl = None
         self._impl_device = None
+        self._is_exhaustive = False
+        self._exhaustive = None
         self.device = torch.device('cpu')
 
     def _release_impl(self):
@@ -128,8 +243,23 @@ class cuBVH:
         self._impl_device = cuda_device
         self.device = cuda_device
 
-    def to(self, device):
+    def to(self, device, *args, **kwargs):
         device = self._parse_device(device)
+
+        if self._is_exhaustive:
+            if device.type == 'cuda' and not torch.cuda.is_available():
+                raise RuntimeError("CUDA is not available for cuBVH.to().")
+            if device.type not in ('cpu', 'cuda'):
+                raise ValueError(f"Unsupported device for cuBVH: {device}")
+
+            vertices = self._state["vertices"].detach()
+            faces = self._state["faces"].detach()
+            if self._exhaustive is None:
+                self._exhaustive = ExaustiveSearcher(vertices, faces, device)
+            else:
+                self._exhaustive = self._exhaustive.to(device)
+            self.device = device
+            return self
 
         if device.type == 'cuda':
             if not torch.cuda.is_available():
@@ -150,6 +280,8 @@ class cuBVH:
         return self
 
     def _require_impl(self):
+        if self._is_exhaustive:
+            raise RuntimeError("cuBVH was built with fewer than 8 triangles; only unsigned_distance is supported.")
         if self._impl is None:
             raise RuntimeError("cuBVH is on CPU; call cuBVH.to('cuda') before querying.")
         return self._impl
@@ -183,10 +315,6 @@ class cuBVH:
         return positions, face_id, depth
 
     def unsigned_distance(self, positions, return_uvw=False):
-        impl = self._require_impl()
-        if self.device.type != 'cuda':
-            raise RuntimeError("cuBVH must be on a CUDA device to query distances.")
-
         target_device = self.device
         positions = positions.to(device=target_device, dtype=torch.float32, non_blocking=True).contiguous()
 
@@ -195,16 +323,26 @@ class cuBVH:
 
         n_points = positions.shape[0]
 
-        with self._cuda_device_guard(target_device):
-            distances = torch.empty(n_points, dtype=torch.float32, device=target_device)
-            face_id = torch.empty(n_points, dtype=torch.int64, device=target_device)
+        if self._is_exhaustive:
+            if self._exhaustive is None:
+                raise RuntimeError("Exhaustive searcher not initialized.")
 
-            if return_uvw:
-                uvw = torch.empty(n_points, 3, dtype=torch.float32, device=target_device)
-            else:
-                uvw = None
+            distances, face_id, uvw = self._exhaustive.unsigned_distance(positions, return_uvw)
+        else:
+            impl = self._require_impl()
+            if self.device.type != 'cuda':
+                raise RuntimeError("cuBVH must be on a CUDA device to query distances.")
 
-            impl.unsigned_distance(positions, distances, face_id, uvw)
+            with self._cuda_device_guard(target_device):
+                distances = torch.empty(n_points, dtype=torch.float32, device=target_device)
+                face_id = torch.empty(n_points, dtype=torch.int64, device=target_device)
+
+                if return_uvw:
+                    uvw = torch.empty(n_points, 3, dtype=torch.float32, device=target_device)
+                else:
+                    uvw = None
+
+                impl.unsigned_distance(positions, distances, face_id, uvw)
 
         distances = distances.view(*prefix)
         face_id = face_id.view(*prefix)
@@ -249,10 +387,16 @@ class cuBVH:
 
     @property
     def triangles_cpu(self):
+        if self._is_exhaustive:
+            vertices = self._state["vertices"].detach().cpu()
+            faces = self._state["faces"].detach().cpu().long()
+            return vertices[faces].contiguous().clone().numpy()
         return self._state["triangles"].detach().cpu().clone().numpy()
 
     @property
     def bvh_nodes_cpu(self):
+        if self._is_exhaustive:
+            raise RuntimeError("Exhaustive search mode does not have BVH nodes.")
         return {
             "mins": self._state["node_mins"].detach().cpu().clone().numpy(),
             "maxs": self._state["node_maxs"].detach().cpu().clone().numpy(),
@@ -262,11 +406,18 @@ class cuBVH:
     def __getstate__(self):
         return {
             "state": self.export_state(),
-            "device": str(self.device),
+            "device": "cpu",
         }
 
     def __setstate__(self, state):
-        self.__init__(state=state["state"], device=state.get("device", "cpu"))
+        serialized_state = state["state"]
+        load_device = state.get("device", "cpu")
+        if isinstance(load_device, torch.device):
+            if load_device.type == "cuda":
+                load_device = "cpu"
+        elif isinstance(load_device, str) and load_device.startswith("cuda"):
+            load_device = "cpu"
+        self.__init__(state=serialized_state, device=load_device)
 
     @contextlib.contextmanager
     def _cuda_device_guard(self, device):
@@ -455,3 +606,169 @@ def parallel_decimate(vertices: np.ndarray, faces: np.ndarray, target_vertices: 
     faces = faces.astype(np.int32)
     v, f = _backend.parallel_decimate(vertices, faces, int(target_vertices))
     return v, f
+
+
+class ExaustiveSearcher:
+    """Fallback distance queries via exhaustive point-triangle search."""
+    def __init__(self, vertices, triangles, device):
+        if device is None:
+            device = torch.device('cpu')
+        else:
+            device = torch.device(device)
+
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available for ExaustiveSearcher.")
+
+        vertices_tensor = torch.as_tensor(vertices, dtype=torch.float32)
+        faces_tensor = torch.as_tensor(triangles, dtype=torch.long)
+
+        if faces_tensor.numel() == 0:
+            raise ValueError("ExaustiveSearcher requires at least one triangle.")
+
+        self.device = device
+        self.vertices = vertices_tensor.to(device=device, dtype=torch.float32).contiguous().clone()
+        self.faces = faces_tensor.to(device=device, dtype=torch.long).contiguous().clone()
+
+        self._refresh_triangle_vertices()
+
+    def _refresh_triangle_vertices(self):
+        if self.faces.numel() == 0:
+            self._triangle_vertices = self.vertices.new_zeros((0, 3, 3))
+        else:
+            self._triangle_vertices = self.vertices[self.faces]
+
+    def to(self, device):
+        device = torch.device(device)
+        if device.type == 'cuda' and not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available for ExaustiveSearcher.to().")
+        if device == self.device:
+            return self
+
+        self.vertices = self.vertices.to(device=device, non_blocking=True)
+        self.faces = self.faces.to(device=device)
+        self.device = device
+        self._refresh_triangle_vertices()
+        return self
+
+    def unsigned_distance(self, positions, return_uvw=False):
+        if self._triangle_vertices.numel() == 0:
+            raise RuntimeError("ExaustiveSearcher requires triangles to compute distances.")
+
+        points = positions.to(device=self.device, dtype=torch.float32, non_blocking=True).contiguous()
+        n_points = points.shape[0]
+
+        best_sqdist = torch.full((n_points,), float('inf'), dtype=torch.float32, device=self.device)
+        best_face = torch.full((n_points,), -1, dtype=torch.int64, device=self.device)
+        best_bary = torch.zeros((n_points, 3), dtype=torch.float32, device=self.device) if return_uvw else None
+
+        for idx in range(self._triangle_vertices.shape[0]):
+            tri = self._triangle_vertices[idx]
+            sq_dist, bary = self._point_triangle_distance(points, tri)
+            better = sq_dist < best_sqdist
+            if better.any():
+                best_sqdist[better] = sq_dist[better]
+                best_face[better] = idx
+                if return_uvw:
+                    best_bary[better] = bary[better]
+
+        distances = torch.sqrt(best_sqdist.clamp_min(0.0))
+        if return_uvw:
+            return distances, best_face, best_bary
+        return distances, best_face, None
+
+    @staticmethod
+    def _point_triangle_distance(points, tri):
+        eps = 1e-12
+
+        a, b, c = tri[0], tri[1], tri[2]
+        ab = b - a
+        ac = c - a
+        ap = points - a
+        d1 = (ab * ap).sum(dim=-1)
+        d2 = (ac * ap).sum(dim=-1)
+
+        bp = points - b
+        d3 = (ab * bp).sum(dim=-1)
+        d4 = (ac * bp).sum(dim=-1)
+
+        cp = points - c
+        d5 = (ab * cp).sum(dim=-1)
+        d6 = (ac * cp).sum(dim=-1)
+
+        bary = torch.zeros(points.shape[0], 3, dtype=points.dtype, device=points.device)
+        assigned = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+
+        mask = (d1 <= 0) & (d2 <= 0)
+        if mask.any():
+            bary[mask, 0] = 1
+            assigned |= mask
+
+        mask = (d3 >= 0) & (d4 <= d3) & (~assigned)
+        if mask.any():
+            bary[mask, 1] = 1
+            assigned |= mask
+
+        mask = (d6 >= 0) & (d5 <= d6) & (~assigned)
+        if mask.any():
+            bary[mask, 2] = 1
+            assigned |= mask
+
+        vc = d1 * d4 - d3 * d2
+        mask = (vc <= 0) & (d1 >= 0) & (d3 <= 0) & (~assigned)
+        if mask.any():
+            denom = (d1 - d3)[mask]
+            v = d1[mask] / (denom + eps)
+            bary[mask, 0] = 1 - v
+            bary[mask, 1] = v
+            assigned |= mask
+
+        vb = d5 * d2 - d1 * d6
+        mask = (vb <= 0) & (d2 >= 0) & (d6 <= 0) & (~assigned)
+        if mask.any():
+            denom = (d2 - d6)[mask]
+            w = d2[mask] / (denom + eps)
+            bary[mask, 0] = 1 - w
+            bary[mask, 2] = w
+            assigned |= mask
+
+        va = d3 * d6 - d5 * d4
+        mask = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0) & (~assigned)
+        if mask.any():
+            numerator = (d4 - d3)[mask]
+            denom = (d4 - d3 + d5 - d6)[mask]
+            w = numerator / (denom + eps)
+            bary[mask, 1] = 1 - w
+            bary[mask, 2] = w
+            assigned |= mask
+
+        mask = ~assigned
+        if mask.any():
+            denom = (va + vb + vc)[mask]
+            v = vb[mask] / (denom + eps)
+            w = vc[mask] / (denom + eps)
+            bary[mask, 0] = 1 - v - w
+            bary[mask, 1] = v
+            bary[mask, 2] = w
+            assigned |= mask
+
+        if not assigned.all():
+            remaining = ~assigned
+            if remaining.any():
+                verts = torch.stack([a, b, c], dim=0)
+                diff = points[remaining].unsqueeze(1) - verts.unsqueeze(0)
+                sq = (diff * diff).sum(dim=-1)
+                _, min_idx = sq.min(dim=-1)
+                bary_fallback = torch.zeros((min_idx.shape[0], 3), dtype=points.dtype, device=points.device)
+                bary_fallback.scatter_(1, min_idx.unsqueeze(1), 1.0)
+                bary[remaining] = bary_fallback
+                assigned[remaining] = True
+
+        closest = (
+            bary[:, 0:1] * a.unsqueeze(0)
+            + bary[:, 1:2] * b.unsqueeze(0)
+            + bary[:, 2:3] * c.unsqueeze(0)
+        )
+        diff = closest - points
+        sq_dist = (diff * diff).sum(dim=-1)
+
+        return sq_dist, bary
